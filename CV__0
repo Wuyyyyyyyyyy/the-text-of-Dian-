@@ -1,0 +1,621 @@
+import os
+from glob import glob
+import torch as t
+from PIL import Image
+import torch.nn as nn
+from tqdm.auto import tqdm
+from torchvision import transforms
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from torch.utils.data import DataLoader, Dataset
+import pandas as pd
+import numpy as np
+import torch.nn.functional as F
+import json
+from torchvision.models.mobilenet import mobilenet_v2
+from torchvision.models.resnet import resnet50, resnet18
+from torchsummary import summary
+import random
+
+
+class SVHNDataset(Dataset):
+    def __init__(self, img_path, img_label, transform=None):
+        self.img_path = img_path
+        self.img_label = img_label
+        if transform is not None:
+            self.transform = transform
+        else:
+            self.transform = None
+
+    def __getitem__(self, index):
+        img = Image.open(self.img_path[index]).convert('RGB')
+
+        if self.transform is not None:
+            img = self.transform(img)
+
+        lbl = np.array(self.img_label[index], dtype=np.int)
+        lbl = list(lbl) + (5 - len(lbl)) * [10]
+        return img, t.from_numpy(np.array(lbl[:5]))
+
+    def __len__(self):
+        return len(self.img_path)
+
+
+train_path = glob('/Users/mac/PycharmProjects/pythonProject1/cv/mchar_train/*.png')
+train_path.sort()
+train_json = json.load(open('train.json'))
+train_label = [train_json[x]['label'] for x in train_json]
+print(len(train_path), len(train_label))
+
+train_loader = t.utils.data.DataLoader(
+        SVHNDataset(train_path, train_label,
+                    transforms.Compose([
+                        transforms.Resize((64, 128)),
+                        transforms.RandomCrop((60, 120)),
+                        transforms.ColorJitter(0.3, 0.3, 0.2),
+                        transforms.RandomRotation(10),
+                        transforms.ToTensor(),
+                        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+                    ])),
+        batch_size=40,
+        shuffle=True,
+        num_workers=8,
+    )
+
+val_path = glob('/Users/mac/PycharmProjects/pythonProject1/cv/mchar_val/*.png')
+val_path.sort()
+val_json = json.load(open('val.json'))
+val_label = [val_json[x]['label'] for x in val_json]
+print(len(val_path), len(val_label))
+
+val_loader = t.utils.data.DataLoader(
+        SVHNDataset(val_path, val_label,
+                    transforms.Compose([
+                        transforms.Resize((60, 120)),
+                        transforms.ToTensor(),
+                        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+                    ])),
+        batch_size=40,
+        shuffle=False,
+        num_workers=8,
+    )
+
+data_dir = {
+    'train_data': '/mchar_train/',
+    'val_data': '/mchar_val/',
+    'test_data': '/mchar_test_a/',
+    'train_label': 'train.json',
+    'val_label': 'val.json',
+    'submit_file': '/mchar_sample_submit_A.csv'
+}
+
+class Config:
+    batch_size = 64
+
+    lr = 1e-3
+
+    momentum = 0.9
+
+    weights_decay = 1e-4
+
+    class_num = 11
+
+    eval_interval = 1
+
+    checkpoint_interval = 1
+
+    print_interval = 50
+
+    checkpoints = 'checkpoints/' 
+
+    pretrained = glob('epoch-resnet18.pth')  
+
+    start_epoch = 52
+
+    epoches = 100
+    smooth = 0.1
+
+    erase_prob = 0.5
+
+
+config = Config()
+
+
+class DigitsDataset(Dataset):
+ 
+    def __init__(self, mode='train', size=(128, 256), aug=True):
+        super(DigitsDataset, self).__init__()
+
+        self.aug = aug
+        self.size = size
+        self.mode = mode
+        self.width = 224
+        self.batch_count = 0
+        if mode == 'test':
+            self.imgs = glob(data_dir['test_data'] + '*.png')
+            self.labels = None
+        else:
+            labels = json.load(open(data_dir['%s_label' % mode], 'r'))
+
+            imgs = glob(data_dir['%s_data' % mode] + '*.png')
+            self.imgs = [(img, labels[os.path.split(img)[-1]]) for img in imgs
+                         if os.path.split(img)[-1] in labels]
+
+    def __getitem__(self, idx):
+        if self.mode != 'test':
+            img, label = self.imgs[idx]
+        else:
+            img = self.imgs[idx]
+            label = None
+        img = Image.open(img)
+        trans0 = [
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ]
+        min_size = self.size[0] if (img.size[1] / self.size[0]) < ((img.size[0] / self.size[1])) else self.size[1]
+        trans1 = [
+            transforms.Resize(128),
+            transforms.CenterCrop((128, self.width))
+        ]
+        if self.aug:
+            trans1.extend([
+                transforms.ColorJitter(0.1, 0.1, 0.1),
+                transforms.RandomGrayscale(0.1),
+                transforms.RandomAffine(15, translate=(0.05, 0.1), shear=5)
+            ])
+        trans1.extend(trans0)
+        if self.mode != 'test':
+            return transforms.Compose(trans1)(img), t.tensor(
+                label['label'][:4] + (4 - len(label['label'])) * [10]).long()
+        else:
+            return transforms.Compose(trans1)(img), self.imgs[idx]
+
+    def __len__(self):
+        return len(self.imgs)
+
+    def collect_fn(self, batch):
+        imgs, labels = zip(*batch)
+        if self.mode == 'train':
+            if self.batch_count > 0 and self.batch_count % 10 == 0:
+                self.width = random.choice(range(224, 256, 16))
+
+        self.batch_count += 1
+        return t.stack(imgs).float(), t.stack(labels)
+
+
+class DigitsMobilenet(nn.Module):
+
+  def __init__(self, class_num=11):
+    super(DigitsMobilenet, self).__init__()
+
+    self.net = mobilenet_v2(pretrained=True).features
+    self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+    self.bn = nn.BatchNorm1d(1280)
+    self.fc1 = nn.Linear(1280, class_num)
+    self.fc2 = nn.Linear(1280, class_num)
+    self.fc3 = nn.Linear(1280, class_num)
+    self.fc4 = nn.Linear(1280, class_num)
+
+  def forward(self, img):
+    features = self.avgpool(self.net(img)).view(-1, 1280)
+    features = self.bn(features)
+
+    fc1 = self.fc1(features)
+    fc2 = self.fc2(features)
+    fc3 = self.fc3(features)
+    fc4 = self.fc4(features)
+
+
+    return fc1, fc2, fc3, fc4
+
+
+class DigitsResnet18(nn.Module):
+
+  def __init__(self, class_num=11):
+    super(DigitsResnet18, self).__init__()
+    self.net = resnet18(pretrained=True)
+    self.net.fc = nn.Identity()
+    self.bn = nn.BatchNorm1d(512)
+    self.fc1 = nn.Linear(512, class_num)
+    self.fc2 = nn.Linear(512, class_num)
+    self.fc3 = nn.Linear(512, class_num)
+    self.fc4 = nn.Linear(512, class_num)
+
+
+  def forward(self, img):
+    features = self.net(img).squeeze()
+
+    fc1 = self.fc1(features)
+    fc2 = self.fc2(features)
+    fc3 = self.fc3(features)
+    fc4 = self.fc4(features)
+
+
+    return fc1, fc2, fc3, fc4
+
+
+class DigitsResnet50(nn.Module):
+    def __init__(self, class_num=11):
+        super(DigitsResnet50, self).__init__()
+
+        # resnet18
+        self.net = resnet50(pretrained=True)
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
+        self.net = nn.Sequential(*list(self.net.children())[:-1])  # 去除最后一个fc layer
+        self.cnn = self.net
+
+        self.hd_fc1 = nn.Linear(2048, 128)  
+        self.hd_fc2 = nn.Linear(2048, 128)
+        self.hd_fc3 = nn.Linear(2048, 128)
+        self.hd_fc4 = nn.Linear(2048, 128)
+        self.dropout_1 = nn.Dropout(0.25)
+        self.dropout_2 = nn.Dropout(0.25)
+        self.dropout_3 = nn.Dropout(0.25)
+        self.dropout_4 = nn.Dropout(0.25)
+        self.fc1 = nn.Linear(128, 11)
+        self.fc2 = nn.Linear(128, 11)
+        self.fc3 = nn.Linear(128, 11)
+        self.fc4 = nn.Linear(128, 11)
+
+    def forward(self, img):
+        feat = self.cnn(img)
+        feat = feat.view(feat.shape[0], -1)
+
+        feat1 = self.hd_fc1(feat)
+        feat2 = self.hd_fc2(feat)
+        feat3 = self.hd_fc3(feat)
+        feat4 = self.hd_fc4(feat)
+        feat1 = self.dropout_1(feat1)
+        feat2 = self.dropout_2(feat2)
+        feat3 = self.dropout_3(feat3)
+        feat4 = self.dropout_4(feat4)
+
+        c1 = self.fc1(feat1)
+        c2 = self.fc2(feat2)
+        c3 = self.fc3(feat3)
+        c4 = self.fc4(feat4)
+
+
+        return c1, c2, c3, c4
+
+
+net = resnet18(pretrained=True)
+summary(net, input_size=(3, 64, 128), batch_size=config.batch_size)
+
+
+net = DigitsResnet18()
+print(net)
+
+summary(net, input_size=(3, 64, 128), batch_size=config.batch_size)
+
+
+class LabelSmoothEntropy(nn.Module):
+    def __init__(self, smooth=0.1, class_weights=None, size_average='mean'):
+        super(LabelSmoothEntropy, self).__init__()
+        self.size_average = size_average
+        self.smooth = smooth
+
+        self.class_weights = class_weights
+
+    def forward(self, preds, targets):
+
+        lb_pos, lb_neg = 1 - self.smooth, self.smooth / (preds.shape[0] - 1)
+
+        smoothed_lb = t.zeros_like(preds).fill_(lb_neg).scatter_(1, targets[:, None], lb_pos)
+
+        log_soft = F.log_softmax(preds, dim=1)
+
+        if self.class_weights is not None:
+            loss = -log_soft * smoothed_lb * self.class_weights[None, :]
+
+        else:
+            loss = -log_soft * smoothed_lb
+
+        loss = loss.sum(1)
+        if self.size_average == 'mean':
+            return loss.mean()
+        elif self.size_average == 'sum':
+            return loss.sum()
+        else:
+            raise NotImplementedError
+
+
+class SnapShotBuilder():
+
+    def __init__(self, n_epoch, n_snap):
+        self.n_epoch = n_epoch
+
+        self.n_snap = n_snap
+
+        pass
+
+    def __call__(self):
+        pass
+
+    def _scheduler(self):
+        pass
+
+
+class Trainer:
+
+    def __init__(self, val=True):
+
+        self.device = t.device('cuda') if t.cuda.is_available() else t.device('cpu')
+
+        self.train_set = DigitsDataset(mode='train')
+        self.train_loader = DataLoader(self.train_set, batch_size=config.batch_size, shuffle=True, num_workers=8,
+                                       pin_memory=True,
+                                       drop_last=True, collate_fn=self.train_set.collect_fn)
+
+        if val:
+            self.val_loader = DataLoader(DigitsDataset(mode='val', aug=False), batch_size=config.batch_size,
+                                         num_workers=8, pin_memory=True, drop_last=False)
+        else:
+            self.val_loader = None
+
+        # 可以切换使用resnet或者Mobilenet
+        # self.model = DigitsMobilenet(config.class_num).to(self.device)
+        self.model = DigitsResnet18(config.class_num).to(self.device)
+
+        self.criterion = LabelSmoothEntropy().to(self.device)
+
+        # optimizer可选择SGD或者Adam
+        # self.optimizer = SGD(self.model.parameters(), lr=config.lr, momentum=config.momentum, weight_decay=config.weights_decay, nesterov=True)
+        from torch.optim import Adam
+        # self.optimizer = Adam(self.model.parameters(), lr=1e-3)
+        self.optimizer = Adam(self.model.parameters(), lr=0.001, betas=(0.9, 0.999), eps=1e-08, weight_decay=0,
+                              amsgrad=False)
+        # 学习率调整
+        self.lr_scheduler = CosineAnnealingWarmRestarts(self.optimizer, T_0=10, T_mult=2, eta_min=0)
+        # self.lr_scheduler = (self.optimizer, [10, 20, 30], 0.5)
+        self.best_acc = 0
+
+        # 是否载入预训练模型
+        '''if config.pretrained is not None:
+            self.load_model(config.pretrained)
+            # print('Load model from %s'%config.pretrained)
+            if self.val_loader is not None:
+                acc = self.eval()
+                self.best_acc = acc
+                print('Load model from %s, Eval Acc: %.2f' % (config.pretrained, acc * 100))'''
+
+    def train(self):
+        for epoch in range(config.start_epoch, config.epoches):
+            acc = self.train_epoch(epoch)
+            if (epoch + 1) % config.eval_interval == 0:
+                print('Start Evaluation')
+                if self.val_loader is not None:
+                    acc = self.eval()
+                # 保存最优模型
+                if acc > self.best_acc:
+                    os.makedirs(config.checkpoints, exist_ok=True)
+                    save_path = config.checkpoints + 'epoch-resnet18-%d-bn-acc-%.2f.pth' % (epoch + 1, acc * 100)
+                    self.save_model(save_path)
+                    print('%s saved successfully...' % save_path)
+                    self.best_acc = acc
+
+    def train_epoch(self, epoch):
+        total_loss = 0
+        corrects = 0
+        tbar = tqdm(self.train_loader)
+        self.model.train()
+        for i, (img, label) in enumerate(tbar):
+            # print(img.shape)
+            img = img.to(self.device)
+            label = label.to(self.device)
+            self.optimizer.zero_grad()
+            pred = self.model(img)
+            loss = self.criterion(pred[0], label[:, 0]) + \
+                   self.criterion(pred[1], label[:, 1]) + \
+                   self.criterion(pred[2], label[:, 2]) + \
+                   self.criterion(pred[3], label[:, 3]) \
+                # + self.criterion(pred[4], label[:, 4])
+            total_loss += loss.item()
+            loss.backward()
+            self.optimizer.step()
+            temp = t.stack([
+                t.tensor(pred[0].argmax(1) == label[:, 0]),
+                t.tensor(pred[1].argmax(1) == label[:, 1]),
+                t.tensor(pred[2].argmax(1) == label[:, 2]),
+                t.tensor(pred[3].argmax(1) == label[:, 3])], dim=1)
+
+            corrects += t.all(temp, dim=1).sum().item()
+            tbar.set_description(
+                'loss: %.3f, acc: %.3f' % (loss / (i + 1), corrects * 100 / ((i + 1) * config.batch_size)))
+            if (i + 1) % config.print_interval == 0:
+                self.lr_scheduler.step()
+                return corrects * 100 / ((i + 1) * config.batch_size)
+
+    def eval(self):
+        self.model.eval()
+        corrects = 0
+        with t.no_grad():
+            tbar = tqdm(self.val_loader)
+            for i, (img, label) in enumerate(tbar):
+                img = img.to(self.device)
+                label = label.to(self.device)
+                pred = self.model(img)
+                # temp = t.stack([])
+                temp = t.stack([
+                    t.tensor(pred[0].argmax(1) == label[:, 0]),
+                    t.tensor(pred[1].argmax(1) == label[:, 1]),
+                    t.tensor(pred[2].argmax(1) == label[:, 2]),
+                    t.tensor(pred[3].argmax(1) == label[:, 3]),
+                    ], dim=1)
+
+                corrects += t.all(temp, dim=1).sum().item()
+                tbar.set_description('Val Acc: %.2f' % (corrects * 100 / ((i + 1) * config.batch_size)))
+        self.model.train()
+        return corrects / (len(self.val_loader) * config.batch_size)
+
+    def save_model(self, save_path, save_opt=False, save_config=False):
+        dicts = {}
+        dicts['model'] = self.model.state_dict()
+        if save_opt:
+            dicts['opt'] = self.optimizer.state_dict()
+
+        if save_config:
+            dicts['config'] = {s: config.__getattribute__(s) for s in dir(config) if not s.startswith('_')}
+
+        t.save(dicts, save_path)
+
+    def load_model(self, load_path, changed=False, save_opt=False, save_config=False):
+
+        dicts = t.load(load_path)
+        if not changed:
+            self.model.load_state_dict(dicts['model'])
+
+        else:
+            dicts = t.load(load_path)['model']
+
+            keys = list(net.state_dict().keys())
+            values = list(dicts.values())
+
+            new_dicts = {k: v for k, v in zip(keys, values)}
+            self.model.load_state_dict(new_dicts)
+
+        if save_opt:
+            self.optimizer.load_state_dict(dicts['opt'])
+
+        if save_config:
+            for k, v in dicts['config'].items():
+                config.__setattr__(k, v)
+
+
+if __name__ == '__main__':
+    trainer = Trainer()
+    trainer.train()
+
+
+def predicts(model_path):
+    test_loader = DataLoader(DigitsDataset(mode='test', aug=False), batch_size=config.batch_size, shuffle=False,
+                             num_workers=8, pin_memory=True, drop_last=False)
+    results = []
+    # 因为这里使用了模型融合，所以如果你只是训练出一个模型进行预测，则要把另外一个模型注释掉
+    mb_path = 'epoch-mobilenet-96-bn-acc-74.54.pth'
+    res_path = 'epoch-resnet101-31-bn-acc-75.75.pth'
+    mb_net = DigitsMobilenet().cuda()
+    mb_net.load_state_dict(t.load(mb_path)['model'])
+
+    res_net = DigitsResnet50().cuda()
+    res_net.load_state_dict(t.load(res_path)['model'])
+  
+
+    tbar = tqdm(test_loader)
+    mb_net.eval()
+    res_net.eval()
+    with t.no_grad():
+        for i, (img, img_names) in enumerate(tbar):
+            img = img.cuda()
+            pred = mb_net(img)
+            results += [[name, code] for name, code in zip(img_names, parse2class(pred))]
+
+    results = sorted(results, key=lambda x: x[0])
+
+    write2csv(results)
+    return results
+
+
+def parse2class(prediction):
+
+    ch1, ch2, ch3, ch4 = prediction
+
+    char_list = [str(i) for i in range(10)]
+    char_list.append('')
+
+    ch1, ch2, ch3, ch4 = ch1.argmax(1), ch2.argmax(1), ch3.argmax(1), ch4.argmax(1)
+
+    ch1, ch2, ch3, ch4 = [char_list[i.item()] for i in ch1], [char_list[i.item()] for i in ch2], \
+                         [char_list[i.item()] for i in ch3], [char_list[i.item()] for i in ch4] \
+
+    res = [c1 + c2 + c3 + c4 for c1, c2, c3, c4 in zip(ch1, ch2, ch3, ch4)]
+    return res
+
+
+def write2csv(results):
+ 
+    # 定义输出文件
+    df = pd.DataFrame(results, columns=['file_name', 'file_code'])
+    df['file_name'] = df['file_name'].apply(lambda x: x.split('/')[-1])
+    save_name = 'results-mb.csv'
+    df.to_csv(None, sep=',')
+    print('Results.saved to %s' % save_name)
+
+
+def stack_eval(mb_path, res_path):
+    mb_net = DigitsMobilenet().cuda()
+    dicts = t.load(mb_path)['model']
+    # dicts.popitem()
+    # dicts.popitem()
+    mb_net.load_state_dict(dicts)
+
+    res_net = DigitsResnet50().cuda()
+    res_net.load_state_dict(t.load(res_path)['model'])
+
+    res_net.eval()
+    mb_net.eval()
+    dataset = DigitsDataset(mode='val', aug=False)
+    imgs = glob(data_dir['val_data'] + '*.png')
+    labels = json.load(open(data_dir['val_label'], 'r'))
+    dataset.imgs = [(img, labels[os.path.split(img)[-1]]) for img in imgs if os.path.split(img)[-1] in labels]
+    val_loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=False,
+                            num_workers=16, pin_memory=True, drop_last=False)
+    corrects = 0
+    with t.no_grad():
+        tbar = tqdm(val_loader)
+        for i, (img, label) in enumerate(tbar):
+            img = img.cuda()
+            label = t.tensor(label).long().cuda()
+            pred = [0.4 * a + 0.6 * b for a, b in zip(res_net(img), mb_net(img))]
+
+            # temp = t.stack([])
+            temp = t.stack([
+                t.tensor(pred[0].argmax(1) == label[:, 0]),
+                t.tensor(pred[1].argmax(1) == label[:, 1]),
+                t.tensor(pred[2].argmax(1) == label[:, 2]),
+                t.tensor(pred[3].argmax(1) == label[:, 3])
+                ], dim=1)
+            corrects += t.all(temp, dim=1).sum().item()
+            tbar.set_description('Val Acc: %.2f' % (corrects * 100 / ((i + 1) * config.batch_size)))
+        model.train()
+    return corrects / (len(val_loader) * config.batch_size)
+
+
+def stack_predict(*model, batch_size=64):
+    val_loader = DataLoader(DigitsDataset(mode='test', aug=False), batch_size=batch_size, shuffle=False,
+                            num_workers=8, pin_memory=True, drop_last=False)
+
+    results = []
+    corrects = 0
+    total = 0
+    for m in model:
+        m.eval()
+        m.cuda()
+    tbar = tqdm(val_loader)
+    with t.no_grad():
+        for i, (img, label) in enumerate(tbar):
+            img = img.cuda()
+            # label = label.cuda()
+            # ---------取平均值----------#
+            # ------------74.51---------------#
+            pred = [0] * 4
+            for a in [m(img) for m in model]:
+                pred = [p + a_ for p, a_ in zip(pred, a)]
+            pred = [p / len(model) for p in pred]
+            results += [[name, code] for name, code in zip(label, parse2class(pred))]
+
+    results = sorted(results, key=lambda x: x[0])
+
+    write2csv(results)
+
+
+model_paths = glob('/checkpionts/*.pth')
+models = []
+for m in model_paths:
+    if 'resnet' in m:
+        model = DigitsResnet50()
+    elif 'mobilenet' in m:
+        model = DigitsMobilenet()
+        model.load_state_dict(t.load(m)['model'])
+        models.append(model)
+
+stack_predict(*models, batch_size=256)
